@@ -1,0 +1,647 @@
+import xlwings as xw
+from stop_words import get_stop_words
+from pattern.db import Datasheet
+from pattern.vector import Model, Document, TFIDF, KNN
+import string
+import pypyodbc
+import datetime
+
+def main():
+
+    excelFileSource = r"Tickets.xlsx"
+    #teams = ['Web', 'CMS', 'CMS-O', 'CBIS', 'PNG']
+    teams = ['CBIS']
+    #teams = ['Web', 'CMS', 'CMS-O', 'CBIS']
+
+    create_models(excelFileSource, teams)
+
+    # Get start and stop months. Uses previous month logic
+    thisMonth = datetime.datetime.today()
+    prevMonthDate = thisMonth - datetime.timedelta(days=27)
+
+    for team in teams:
+        newTickets = get_incident_tickets_from_piccaso(prevMonthDate, thisMonth, team)
+
+        print("Found {0} new tickets.".format(len(newTickets)))
+
+        updatedTickets = perform_text_classification(newTickets, team)
+
+        updatedTickets = add_job_name_details(updatedTickets, team)
+
+         # Convert the dictionary object to a list. xlwings is superfast when writing a list to the excel.
+        listOfAllTickets = []
+        for ticket in updatedTickets:
+            listOfAllTickets.append([ticket['Category'], ticket['SubCategory'], ticket['Requestor'], ticket['IncidentID'],
+                                 ticket['ProductName'], ticket['Status'], ticket['StatusReason'], ticket['Summary'],
+                                 ticket['Notes'], ticket['AssignedGroup'], ticket['Assignee'], ticket['Priority'],
+                                 ticket['CreateDate'], ticket['FirstName'], ticket['LastName'],
+                                 ticket['Resolution'], ticket['JobName'], ticket['CategoryWeight'], ticket['SubCategoryWeight']])
+
+        print("Writing to the excel...")
+        # Open excel
+        exlApp = xw.Book(excelFileSource).app
+        exlApp.activate(steal_focus=True)
+        exlBook = exlApp.books.active
+
+        # Find the last row. Records will be appended after this.
+        lastRow = xw.Range('D1').end('down')
+        lastRow = int(lastRow.get_address(False, False, False, False)[1:])
+
+        # Dump it in to the Excel
+        xw.Range('A' + str(lastRow + 1)).value = listOfAllTickets
+        xw.Range('A' + str(lastRow + 1) + ':S35000').api.WrapText = False
+        exlBook.save()
+        print("*"*80)
+        # Done. kthnxbye
+
+
+def add_job_name_details(updateTickets, team):
+
+    for ticket in updateTickets:
+        if ticket['AssignedGroup'] in ['Customer Billing Information System Support']:
+            ticket['JobName'] = add_CBIS_job_names(ticket)
+
+        if ticket['AssignedGroup'] in ['Retail & Marketing Apps Support']:
+            ticket['JobName'] = add_Web_job_name(ticket)
+
+        if ticket['AssignedGroup'] in ['CMS Support - Night Shift', 'CMS Support - Day Shift']:
+            ticket['JobName'] = add_CMS_job_names(ticket)
+
+        if ticket['AssignedGroup'] in ['CMS Other - C&I Metering Apps Support', 'CMS Other - Choice Apps Support', 'CMS Other - Gentran Apps Support',
+                         'CMS Other - Marketing Apps Support', 'CMS Other - Metering Apps Support']:
+            ticket['JobName'] = add_CMSO_job_name(ticket)
+
+    return updateTickets
+
+
+def add_CBIS_job_names(ticket):
+
+    # Now lets look at the job name field
+        try:
+            notes = str(ticket['Notes'])
+            summary = str(ticket['Summary'])
+
+            # We are only focussing on TIVOLI ticket for this field
+            if ticket['Requestor'].strip().upper() == 'TIVOLI':
+
+                # First category
+                if ticket['SubCategory'].strip() == 'Mainframe Batch Process':
+                    # Below split function will provide the mainframe job name
+                    jobname = notes.split('SYSI')[0]
+                    jobname = jobname.split(')')[1]
+                    ticket['JobName'] = jobname.strip()
+
+                # Second category
+                elif ticket['SubCategory'].strip() == 'ESP Failures':
+                    # Below split function will provide the ESP app name
+                    jobname = notes.split('(')[0]
+                    jobname = jobname.split('CAWA:')[1]
+                    jobname = jobname.split('.')[0]
+                    jobname = jobname.translate(str.maketrans('', '', string.digits))
+                    ticket['JobName'] = jobname.strip()
+
+                # Third category
+                elif ticket['SubCategory'].strip() == 'Server Monitoring':
+                    # Below split function will provide the static text from monitoring alerts from these known apps
+                    if 'QPasa' in notes:
+                        jobname = notes.split('--')[0]
+                        jobname = jobname.split(':')[1]
+                    elif 'CA APM' in notes:
+                        jobname = clean_text(summary.split(':')[1])
+                    elif 'BAC mon' in notes:
+                        jobname = clean_text(summary.split(':')[1])
+                    elif 'FreePool'in notes:
+                        jobname = notes.split('E:')[1][:60]
+                    else:
+                        jobname = clean_text(summary[:60])
+
+                    ticket['JobName'] = jobname.strip()
+
+                # Third category
+                elif ticket['SubCategory'].strip() == 'UNIX Batch Failures':
+                    # Below split function will provide the static text from UNIX batch failure alerts from these known apps
+                    if ') SEVERE' in summary:
+                        jobname = summary.split(')')[1]
+                    elif '::/applicationlog' in notes:
+                        jobname = notes.split(':/')[1]
+                    elif 'pdgo' in notes:
+                        jobname =  notes.split('(')[1].split(')')[0]
+                    else:
+                        jobname = summary[:60]
+
+                    ticket['JobName'] = jobname
+
+        except Exception as e:
+            # Since lot of string index property is used above, there is a high probability that index out of range
+            # exception is throw. Catch any exception here and store it in the same field.
+            # User can check and change in the Excel file later
+            ticket['JobName'] = str(e)
+
+        return ticket['JobName']
+
+
+def add_CMSO_job_name(ticket):
+
+    # Now fetch the JobName field
+        try:
+            notes = str(ticket['Notes'])
+            summary = str(ticket['Summary'])
+
+            if ticket['Requestor'].strip().upper() == 'TIVOLI':
+                if 'CA APM Alert' in notes:
+                    jobname = notes.split('-')[0]
+                    ticket['JobName'] = jobname.strip()
+
+                elif 'CAESP' in notes:
+                    jobname = notes.split('(')[0]
+                    ticket['JobName'] = jobname.strip()
+
+                elif 'BAC monitor' in notes:
+                    if 'hreshold' in notes:
+                        jobname = notes.split(':')[0]
+                    else:
+                        jobname = notes.split('-')[0]
+                    ticket['JobName'] = jobname.strip()
+
+                elif 'gentran' in summary:
+                    if ': Session' in notes:
+                        jobname = summary.split(' for')[1][60]
+                        ticket['JobName'] = jobname.strip()
+                    elif 'Voltage' in summary:
+                        jobname = summary.split(',')[0]
+                        ticket['JobName'] = jobname.strip()
+                    elif 'file' in summary:
+                        jobname = notes.split(':')[1][40]
+                        ticket['JobName'] = jobname.strip()
+                    elif 'PGP' in summary:
+                        jobname = notes.split(':')[1][40]
+                        ticket['JobName'] = jobname.strip()
+                    elif 'stopped ' in notes:
+                        jobname = notes.split('service')[0]
+                        ticket['JobName'] = jobname.strip()
+                    else:
+                        jobname = notes[60]
+                        ticket['JobName'] = jobname.strip()
+
+                elif 'size of the file' in notes:
+                    jobname = notes[70]
+                    ticket['JobName'] = jobname.strip()
+
+                elif 'ADAPTER' in notes:
+                    jobname = notes.split(']')[1][60]
+                    ticket['JobName'] = jobname.strip()
+
+                elif 'JBoss' in notes:
+                    jobname = notes.split('service')[0]
+                    ticket['JobName'] = jobname.strip()
+
+        except Exception as e:
+            # Since lot of string index property is used above, there is a high probability that index out of range
+            # exception is throw. Catch any exception here and store it in the same field.
+            # User can check and change in the Excel file later
+            ticket['JobName'] = str(e)
+
+        return ticket['JobName']
+
+
+def add_CMS_job_names(ticket):
+
+    # Now lets look at the job name field
+        try:
+            notes = str(ticket['Notes'])
+            summary = str(ticket['Summary'])
+
+            # We are only focussing on TIVOLI ticket for this field
+            if ticket['Requestor'].strip().upper() == 'TIVOLI':
+
+                # First category
+                if ticket['SubCategory'].strip() == 'C35 Job Failures':
+                    # Below split function will provide the mainframe job name
+                    find = summary.upper().find("C35")
+                    if find == -1:
+                        find = summary.upper().find("C*5")
+                    jobname = summary[find: find + 8]
+                    ticket['JobName'] = jobname.strip()
+
+
+                # Fourth category
+                elif ticket['SubCategory'].strip() == 'Other Job Failures':
+                    # Below split function will provide the static text from UNIX batch failure alerts from these known apps
+                    if 'C44' in summary.upper():
+                        jobname = "C44* Jobs"
+                    else:
+                        jobname = ""
+
+                    ticket['JobName'] = jobname.strip()
+
+                # Fifth category
+                elif ticket['SubCategory'].strip() == 'CICS Transaction Failures':
+                    find = summary.upper().find("CICS")
+                    jobname = summary[find - 4:find + 21]
+                    ticket['JobName'] = jobname.strip()
+
+                # Sixth category
+                elif ticket['SubCategory'].strip() == 'ESP Failures':
+                    # Below split function will provide the ESP app name
+                    jobname = notes.split('(')[0]
+                    ticket['JobName'] = jobname.strip()
+
+                # Seventh category
+                elif ticket['SubCategory'].strip() == 'Storage Issues':
+                    # Below split function will provide the ESP app name
+                    jobname = notes[0:39]
+                    ticket['JobName'] = jobname.strip()
+
+
+        except Exception as e:
+            # Since lot of string index property is used above, there is a high probability that index out of range
+            # exception is throw. Catch any exception here and store it in the same field.
+            # User can check and change in the Excel file later
+            ticket['JobName'] = str(e)
+
+        return ticket['JobName']
+
+
+def add_Web_job_name(ticket):
+
+    # Now fetch the JobName field
+        try:
+            notes = str(ticket['Notes'])
+            summary = str(ticket['Summary'])
+
+            if ticket['Requestor'].strip().upper() == 'TIVOLI':
+                if ticket['Category'].strip() == 'CA Wily':
+                    jobname = summary.split(':')[1][:60]
+                    ticket['JobName'] = jobname.strip()
+
+                elif ticket['Category'].strip() == 'ESP':
+                    jobname = notes.split('(')[0]
+                    ticket['JobName'] = jobname.strip()
+
+                elif ticket['Category'].strip() == 'HP BAC':
+                    if 'hreshold' in notes:
+                        jobname = notes.split(':')[0]
+                    else:
+                        jobname = notes.split('-')[0]
+
+                    ticket['JobName'] = jobname.strip()
+
+        except Exception as e:
+            # Since lot of string index property is used above, there is a high probability that index out of range
+            # exception is throw. Catch any exception here and store it in the same field.
+            # User can check and change in the Excel file later
+            ticket['JobName'] = str(e)
+
+        return ticket['JobName']
+
+
+def perform_text_classification(newTickets, team):
+
+    print("Classification in progress for team - {0}".format(team))
+
+    modelCat = Model.load('{0}-tickets-cat-model.txt'.format(team))
+    #modelSub = Model.load('{0}-tickets-sub-model.txt'.format(team))
+
+    classifierCat = KNN(baseline=None)
+    #classifierSub = KNN(baseline=None)
+    print("Training Categories......")
+    for document in modelCat:
+        classifierCat.train(document)
+    print("Training Sub-Categories......")
+    #for document in modelSub:
+    #    classifierSub.train(document)
+
+    for i, ticket in enumerate(newTickets):
+        categoryResolutionField = get_category_from_resolution_field(ticket["Resolution"])
+        subCategoryResolutionField = get_subcategory_from_resolution_field(ticket["Resolution"])
+
+        fullTicketNotes = '{0} {1}'.format(clean_text(ticket['Summary']), clean_text(ticket['Notes']))
+        categoryMachineLearningOutput = classifierCat.classify(fullTicketNotes, discrete=False).max
+
+        try:
+            categoryMachineLearning = categoryMachineLearningOutput[0].split('>>>')[1]
+        except Exception:
+            categoryMachineLearning = "Nothing"
+
+        try:
+            subCategoryMachineLearning = categoryMachineLearningOutput[0].split('>>>')[2]
+        except Exception:
+            subCategoryMachineLearning = "Nothing"
+
+        try:
+            requestor = categoryMachineLearningOutput[0].split('>>>')[0]
+        except Exception:
+            requestor = None
+
+        #subCategoryMachineLearning = classifierSub.classify(fullTicketNotes, discrete=False).max
+
+        if categoryMachineLearningOutput[1] < 0.7 and categoryResolutionField:
+            ticket["Category"] = categoryResolutionField
+        else:
+            ticket["Category"] = categoryMachineLearning
+            ticket["CategoryWeight"] = categoryMachineLearningOutput[1]
+
+        if categoryMachineLearningOutput[1] < 0.7 and subCategoryResolutionField:
+            ticket["SubCategory"] = subCategoryResolutionField
+        else:
+            ticket["SubCategory"] = subCategoryMachineLearning
+            ticket["SubCategoryWeight"] = categoryMachineLearningOutput[1]
+
+        if requestor:
+            ticket["Requestor"] = requestor
+        else:
+            if ticket["ProductName"].lower() == "tivoli":
+                ticket["Requestor"] = "TIVOLI"
+            else:
+                ticket["Requestor"] = "User"
+
+        print("Completed - {0}%".format(round(i*100/len(newTickets), 2)), end='\r')
+
+    print("Classification done.")
+    return newTickets
+
+
+def create_models(excelFileSource, teams):
+
+    for team in teams:
+        create_csv(excelFileSource, team)
+
+        csvLoad = Datasheet.load('{0}-tickets-cat.csv'.format(team))
+        documents = []
+        for category, ticket in csvLoad:
+            document = Document(ticket, type=category)
+            documents.append(document)
+        m = Model(documents, weight=TFIDF)
+        m.save('{0}-tickets-cat-model.txt'.format(team))
+        print(team)
+        print('Number of documents-cat: ', len(m))
+        print('Number of words: ', len(m.vector))
+
+        # csvLoad = Datasheet.load('{0}-tickets-sub.csv'.format(team))
+        # documents = []
+        # for category, ticket in csvLoad:
+        #     document = Document(ticket, type=category)
+        #     documents.append(document)
+        # m = Model(documents, weight=TFIDF)
+        # m.save('{0}-tickets-sub-model.txt'.format(team))
+        #
+        # print(team)
+        # print('Number of documents-sub: ', len(m))
+        # print('Number of words: ', len(m.vector))
+        print('*'*80)
+
+
+def create_csv(excelFileSource, team):
+
+    listOfTickets = get_historical_tickets_from_excel(excelFileSource, team)
+
+    dsCat = Datasheet()
+    #dsSub = Datasheet()
+
+    for ticket in listOfTickets:
+        fullTicketNotes = '{0} {1}'.format(clean_text(ticket['Summary']), clean_text(ticket['Notes']))
+        category = "{0}>>>{1}>>>{2}".format(ticket['Requestor'], ticket['Category'], ticket['SubCategory'])
+        dsCat.append([category, fullTicketNotes])
+        #dsSub.append([ticket['SubCategory'], fullTicketNotes])
+
+    dsCat.save('{0}-tickets-cat.csv'.format(team))
+    #dsSub.save('{0}-tickets-sub.csv'.format(team))
+
+
+def get_historical_tickets_from_excel(excelFileSource, team):
+
+    # Fetches the existing tickets from the excel repository. This is needed for machine learning algo
+
+    # TODO: 1. Uses hardcoded Piccaso groups here in the function. Can be improved.
+
+    # Picks the piccaso groups for the given team. To add more groups, please add to the list separated by comma
+    if team == 'CBIS':
+        piccasoGroups = ['']
+    elif team == 'Web':
+        piccasoGroups = ['']
+    elif team == 'CMS':
+        piccasoGroups = ['']
+    elif team =='EAM':
+        piccasoGroups = ['']
+    elif team == 'PNG':
+        piccasoGroups = ['']
+    elif team == 'CMS-O':
+        piccasoGroups = ['']
+    else:
+        piccasoGroups = ['']
+
+    # Open excel
+    exlApp = xw.Book(excelFileSource).app
+    exlApp.activate(steal_focus=True)
+    exlBook = exlApp.books.active
+
+    # Get the last row from the Excel
+    lastRow = xw.Range('D1').end('down')
+    lastRow = int(lastRow.get_address(False, False, False, False)[1:])
+    # Copy all the historical tickets to the list object from Excel
+    records = xw.Range('A2:Q' + str(lastRow)).value
+    listOfTickets = []
+
+    # We will use dictionary list to store all the ticket data
+    for record in records:
+        # Pick only relevant team tickets
+        if record[9] in piccasoGroups:
+            ticket = {}
+            ticket['Category'] = record[0]
+            ticket['SubCategory'] = record[1]
+            ticket['Requestor'] = record[2]
+            ticket['IncidentID']         = record[3]
+            ticket['ProductName'] = record[4]
+            ticket['Status'] = record[5]
+            ticket['StatusReason'] = record[6]
+            ticket['Summary']         = record[7]
+            ticket['Notes'] = record[8]
+            ticket['AssignedGroup'] = record[9]
+            ticket['Assignee'] = record[10]
+            ticket['Priority'] = record[11]
+            ticket['CreateDate'] = record[12]
+            ticket['FirstName'] = record[13]
+            ticket['LastName']  = record[14]
+            ticket['Resolution'] = record[15]
+            ticket['JobName'] = record[16]
+
+            if ticket['ProductName'] == 'Netcool':
+                ticket['ProductName'] = 'TIVOLI'
+
+            listOfTickets.append(ticket)
+
+    exlBook.close()
+    exlApp.quit()
+
+    return listOfTickets
+
+
+def clean_text(text):
+
+    # This is an important step to remove noise from the text/summary/notes.
+    # Punctuations and numbers are recommended to be removed for machine learning part for auto ticket categorization
+    # This also uses stop-words. These are commonly used English words like the, I, and, etc.
+    if text:
+        badChars = string.punctuation + '0123456789'
+        stopWords = get_stop_words('en')
+        summary = ''.join(letter for letter in str(text) if letter not in badChars)
+        final = ' '.join(word for word in summary.split(' ') if word.lower() not in stopWords)
+        return final.replace('\n', ' ').replace('\r', '')
+    else:
+        return ''
+
+
+def get_incident_tickets_from_piccaso(fromDate, toDate, team):
+
+    # TODO: 1. Team name hardcoded. Can be improved.
+    # TODO: 2. Use dynamic DSN rather the one used in this function. Currently the DSN must be created manually locally via admin control panel
+
+    # Query to fetch all open and closed tickets
+    if team == 'CBIS':
+        query = '''
+        SELECT Incident_ID, Classification_Product_Name, Status, Status_Reason, Summary_Description, Detailed_Description,
+        Assigned_Group_Name, Assignee_Full_Name, Priority, Create_Dt, Resolution_Description, Customer_First_Name, [Customer_Last_Name]
+        FROM  
+        Where Assigned_Group_Name in ('Customer Billing Information System Support')
+        AND STATUS not IN ('Cancelled')
+        AND Assignee_Full_Name IS NOT NULL
+        AND Create_Dt between '{startDate}' and '{endDate}'
+        order by Incident_ID
+
+        '''
+
+    elif team == 'Web':
+        query = '''
+        SELECT Incident_ID, Classification_Product_Name, Status, Status_Reason, Summary_Description, Detailed_Description,
+        Assigned_Group_Name, Assignee_Full_Name, Priority, Create_Dt, Resolution_Description, Customer_First_Name, [Customer_Last_Name]
+        FROM  
+        Where Assigned_Group_Name in ('Retail & Marketing Apps Support')
+        AND STATUS not IN ('Cancelled')
+        AND Assignee_Full_Name IS NOT NULL
+        AND Create_Dt between '{startDate}' and '{endDate}'
+        order by Incident_ID
+
+        '''
+
+    elif team == 'CMS':
+        query = '''
+        SELECT Incident_ID, Classification_Product_Name, Status, Status_Reason, Summary_Description, Detailed_Description,
+        Assigned_Group_Name, Assignee_Full_Name, Priority, Create_Dt, Resolution_Description, Customer_First_Name, [Customer_Last_Name]
+        FROM 
+        Where Assigned_Group_Name in ('CMS Support - Day Shift', 'CMS Support - Night Shift')
+        AND STATUS not IN ('Cancelled')
+        AND Assignee_Full_Name IS NOT NULL
+        AND Create_Dt between '{startDate}' and '{endDate}'
+        order by Incident_ID
+
+        '''
+
+    elif team == 'EAM':
+        query = '''
+        SELECT Incident_ID, Classification_Product_Name, Status, Status_Reason, Summary_Description, Detailed_Description,
+        Assigned_Group_Name, Assignee_Full_Name, Priority, Create_Dt, Resolution_Description, Customer_First_Name, [Customer_Last_Name]
+        FROM  
+        Where Assigned_Group_Name in ('EAM Portfolio Hub Support','EAM Portfolio Apps and Hub Support','EAM Portfolio Security Administration','SCWM Environment Management')
+        AND STATUS not IN ('Cancelled')
+        AND Assignee_Full_Name IS NOT NULL
+        AND Create_Dt between '{startDate}' and '{endDate}'
+        order by Incident_ID
+
+        '''
+
+    elif team == 'PNG':
+        query = '''
+        SELECT Incident_ID, Classification_Product_Name, Status, Status_Reason, Summary_Description, Detailed_Description,
+        Assigned_Group_Name, Assignee_Full_Name, Priority, Create_Dt, Resolution_Description, Customer_First_Name, [Customer_Last_Name]
+        FROM
+        Where Assigned_Group_Name in ('PNG S2K Support', 'PNG S2K Interfaces and Web Apps Support')
+        AND STATUS not IN ('Cancelled')
+        AND Assignee_Full_Name IS NOT NULL
+        AND Create_Dt between '{startDate}' and '{endDate}'
+        order by Incident_ID
+
+        '''
+
+    elif team == 'CMS-O':
+        query = '''
+        SELECT Incident_ID, Classification_Product_Name, Status, Status_Reason, Summary_Description, Detailed_Description,
+        Assigned_Group_Name, Assignee_Full_Name, Priority, Create_Dt, Resolution_Description, Customer_First_Name, [Customer_Last_Name]
+        FROM
+        Where Assigned_Group_Name in ('CMS Other - C&I Metering Apps Support',
+        'CMS Other - Choice Apps Support', 'CMS Other - Gentran Apps Support',
+        'CMS Other - Marketing Apps Support', 'CMS Other - Metering Apps Support')
+        AND STATUS not IN ('Cancelled')
+        AND Assignee_Full_Name IS NOT NULL
+        AND Create_Dt between '{startDate}' and '{endDate}'
+        order by Incident_ID
+
+        '''
+
+    else:
+        query = ''
+
+    # Connect to the Piccaso DW database. Must have DSN created locally with the name PiccasoSQL.
+    cxn = pypyodbc.connect('DSN=')
+    # Activate the cursor
+    cursor = cxn.cursor()
+
+    # Execute the query. If you want to change the start and end datetime, modify the below strftime function.
+    query = query.format(startDate=fromDate.strftime("%m/01/%Y 12:00:00 AM"), endDate=toDate.strftime("%m/01/%Y 12:00:00 AM"))
+    #query = query.format(startDate=fromDate.strftime("11/01/2017 12:00:00 AM"), endDate=toDate.strftime("02/01/2018 12:00:00 AM"))
+    cursor.execute(query)
+    #cursor.execute(query.format(startDate="08/01/2017 12:00:00 AM", endDate="09/01/2017 12:00:00 AM"))
+
+    # Fetch all rows in the rows object
+    rows = cursor.fetchall()
+    # Create dictionary object to store the ticket list
+    ticketsList = []
+    # Use loop to go through each and save it in the above dictionary
+    for row in rows:
+        ticket = {}
+        ticket['IncidentID'] = row[0]
+        ticket['ProductName'] = row[1]
+        ticket['Status'] = row[2]
+        ticket['StatusReason'] = row[3]
+        ticket['Summary'] = row[4]
+        ticket['Notes'] = row[5]
+        ticket['AssignedGroup'] = row[6]
+        ticket['Assignee'] = row[7]
+        ticket['Priority'] = row[8]
+        ticket['CreateDate'] = row[9]
+        ticket['Resolution'] = row[10]
+        ticket['FirstName'] = row[11]
+        ticket['LastName'] = row[12]
+        ticket['JobName'] = ''
+        ticket['CategoryWeight'] = ''
+        ticket['SubCategoryWeight'] =''
+        ticket['Requestor'] = ''
+
+        ticketsList.append(ticket)
+
+    return ticketsList
+
+
+def get_category_from_resolution_field(resolution):
+
+    # Extract the category field from resolution template
+    try:
+        category = resolution.split('Category -')[1].split('\n')[0].strip()
+    except Exception:
+        category = None
+
+    return category
+
+
+def get_subcategory_from_resolution_field(resolution):
+
+    # Extract the sub category field from resolution template
+    try:
+        subCategory = resolution.split('Sub-Category -')[1].split('\n')[0].strip()
+    except Exception:
+        subCategory = None
+
+    return subCategory
+
+
+if __name__=='__main__':
+    main()
